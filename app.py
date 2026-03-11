@@ -265,44 +265,95 @@ def text_to_flowables(text: str, style, tmp_dir: str) -> list:
     return flowables
 
 # ── Gemini extraction ─────────────────────────────────────────────────────────
-EXTRACTION_PROMPT = """
-You are an expert MCQ extractor for Grade 12 STEM subjects (Physics, Math, Chemistry, English).
+EXTRACTION_PROMPT = (
+    "You are an expert MCQ extractor for Grade 12 STEM subjects "
+    "(Physics, Math, Chemistry, English).\n\n"
+    "Given the following content from a practice/question-solving session, "
+    "extract ALL MCQ questions present.\n\n"
+    "CRITICAL JSON RULES:\n"
+    "1. Return ONLY a raw JSON array. No markdown fences, no explanation.\n"
+    "2. ALL backslashes in math MUST be doubled inside JSON strings.\n"
+    "   Example: write \\\\frac not \\frac, \\\\sqrt not \\sqrt, \\\\times not \\times.\n"
+    "3. Wrap math in dollar signs: \"$\\\\frac{1}{2}$\", \"$\\\\sqrt{3}$\".\n"
+    "4. A single backslash inside a JSON string is INVALID — always double it.\n\n"
+    "Each question object:\n"
+    "{\n"
+    "  \"topic\": \"Topic name\",\n"
+    "  \"question_number\": 1,\n"
+    "  \"question_text\": \"text with math like $\\\\frac{d}{dx}$\",\n"
+    "  \"options\": {\"A\": \"...\", \"B\": \"...\", \"C\": \"...\", \"D\": \"...\"},\n"
+    "  \"correct_answer\": \"A\",\n"
+    "  \"explanation\": \"explanation with math like $\\\\sqrt{2}$\"\n"
+    "}\n\n"
+    "Rules:\n"
+    "- Extract EVERY MCQ — do not skip any.\n"
+    "- Group similar questions under the same topic.\n"
+    "- Infer topic from content if not mentioned.\n"
+    "- Assign A/B/C/D labels if options are unlabeled.\n"
+    "- correct_answer must be only a single letter: A, B, C, or D.\n\n"
+    "Content to extract from:\n"
+)
 
-Given the following content from a practice/question-solving session, extract ALL MCQ questions present.
+def clean_json_response(raw: str) -> str:
+    """
+    Robustly clean a model response so it can be parsed as JSON.
+    Handles: code fences, single-escaped LaTeX backslashes, trailing commas.
+    """
+    # 1. Strip leading/trailing whitespace
+    raw = raw.strip()
+    
+    # 2. Remove markdown code fences
+    raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+    raw = re.sub(r'\s*```\s*$', '', raw, flags=re.MULTILINE)
+    raw = raw.strip()
 
-Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
+    # 3. Fix single-escaped LaTeX backslashes inside JSON strings.
+    #    The model often emits \frac, \sqrt etc. which are invalid JSON escapes.
+    #    We walk char-by-char tracking whether we're inside a string literal.
+    fixed_chars = []
+    in_string   = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            fixed_chars.append(ch)
+            i += 1
+        else:
+            if ch == '\\':
+                nxt = raw[i + 1] if i + 1 < len(raw) else ''
+                if nxt == '\\':
+                    fixed_chars.append('\\\\')
+                    i += 2
+                elif nxt in ('"', 'n', 'r', 't', 'b', 'f', '/', 'u'):
+                    fixed_chars.append(ch)
+                    i += 1
+                else:
+                    # lone backslash — double it
+                    fixed_chars.append('\\\\')
+                    i += 1
+            elif ch == '"':
+                in_string = False
+                fixed_chars.append(ch)
+                i += 1
+            else:
+                fixed_chars.append(ch)
+                i += 1
 
-Each question object must have:
-{
-  "topic": "Topic name (e.g. Kinematics, Integration, Organic Chemistry, Comprehension)",
-  "question_number": <integer>,
-  "question_text": "Full question text. Use standard LaTeX math notation with $ delimiters for any math expressions, e.g. $x^2 + y^2 = r^2$",
-  "options": {
-    "A": "option text",
-    "B": "option text",
-    "C": "option text",
-    "D": "option text"
-  },
-  "correct_answer": "A" or "B" or "C" or "D",
-  "explanation": "Brief explanation of why the answer is correct. Use $ for math."
-}
+    raw = ''.join(fixed_chars)
+    
+    # 4. Remove trailing commas before } or ] (common model mistake)
+    raw = re.sub(r',\s*([}\]])', r'\1', raw)
+    
+    return raw
 
-Rules:
-- Extract EVERY MCQ question present — do not skip any.
-- Group similar questions under the same topic name.
-- If no topic is mentioned, infer it from the subject matter.
-- Preserve all mathematical expressions and formulas in proper LaTeX.
-- If options are not labeled A/B/C/D, assign them in order.
-- The correct_answer must be only the letter: A, B, C, or D.
-
-Content to extract from:
-"""
 
 def extract_mcqs(content: str, api_key: str) -> list[dict]:
     client = genai.Client(api_key=api_key)
     
     response = client.models.generate_content(
-        model='gemini-2.5-flash-lite',
+        model='gemini-2.0-flash-lite',
         contents=EXTRACTION_PROMPT + content,
         config=types.GenerateContentConfig(
             temperature=0.1,
@@ -310,12 +361,18 @@ def extract_mcqs(content: str, api_key: str) -> list[dict]:
         )
     )
     
-    raw = response.text.strip()
-    # Strip markdown code fences if present
-    raw = re.sub(r'^```(?:json)?\s*', '', raw)
-    raw = re.sub(r'\s*```$', '', raw)
+    raw = response.text
+    cleaned = clean_json_response(raw)
     
-    data = json.loads(raw)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        # Surface the cleaned string for debugging
+        raise json.JSONDecodeError(
+            f"{e.msg} — check that content has valid MCQ questions.\n\nFirst 300 chars of cleaned response:\n{cleaned[:300]}",
+            e.doc, e.pos
+        )
+    
     return data
 
 # ── PDF Generation ────────────────────────────────────────────────────────────
