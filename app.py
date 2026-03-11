@@ -302,7 +302,7 @@ def extract_mcqs(content: str, api_key: str) -> list[dict]:
     client = genai.Client(api_key=api_key)
     
     response = client.models.generate_content(
-        model='gemini-2.0-flash-lite',
+        model='gemini-2.5-flash-lite',
         contents=EXTRACTION_PROMPT + content,
         config=types.GenerateContentConfig(
             temperature=0.1,
